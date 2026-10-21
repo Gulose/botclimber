@@ -1,0 +1,1 @@
+Dont overengineer, keep it minimal and add comments explaining cod sections of 4-8 lines. 
