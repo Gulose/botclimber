@@ -16,11 +16,9 @@ GRAVITY = 10.0
 MIN_JUMP_STRENGTH = 5.0
 STRENGTH_STEP = 0.5
 MIN_FLIGHT_CLEARANCE = 1.1
-SIDE_JUMP_MAX_STRENGTH = MAX_JUMP_STRENGTH
-SIDE_JUMP_STEP = 0.25
-SIDE_PLATFORM_BUFFER = 1.0
 PLAYER_WIDTH = 0.8
 PLAYER_HEIGHT = 0.8
+START_POSITION_STEP = 0.2
 POSITION_LOG_INTERVAL = 0.333
 POSITION_LOG_LIMIT = 50
 POSITION_LOG_PATH = "position_log.jsonl"
@@ -44,12 +42,6 @@ def format_platform_coordinates(rect: dict[str, Any]) -> str:
 def platform_top(rect: dict[str, Any]) -> float:
     """Gibt die obere Kante der Plattform zur Landeberechnung zurueck."""
     return rect.get("y", 0.0) + rect.get("height", 0.0)
-
-
-def player_height(state: dict[str, Any]) -> float:
-    """Liest die Spielerhoehe aus dem Zustand mit Fallback auf 0.8."""
-    dimensions = state.get("dimensions", {})
-    return dimensions.get("y", dimensions.get("x", PLAYER_HEIGHT))
 
 
 def calculate_flight_trajectory(
@@ -223,6 +215,69 @@ def target_points(
     return sorted(set(points), key=lambda point: abs(point - position_x))
 
 
+def platform_start_points(
+    rect: dict[str, float],
+    body_width: float,
+    preferred_x: float | None = None,
+) -> list[float]:
+    """Erzeugt begehbare Spielerzentren in festen Abstaenden auf einer Plattform."""
+    left = rect["x"] + body_width / 2
+    right = rect["x"] + rect["width"] - body_width / 2
+    if right < left:
+        return [rect["x"] + rect["width"] / 2]
+
+    points = [left]
+    while points[-1] + START_POSITION_STEP < right:
+        points.append(points[-1] + START_POSITION_STEP)
+    points.append(right)
+    if preferred_x is not None and left <= preferred_x <= right:
+        points.append(preferred_x)
+    return sorted(set(round(point, 10) for point in points), key=lambda point: (
+        abs(point - preferred_x) if preferred_x is not None else 0.0,
+        point,
+    ))
+
+
+def find_trajectory_to_platform(
+    start: dict[str, float],
+    target_platform: dict[str, Any],
+    platforms: list[dict[str, Any]],
+    ignored_platform: dict[str, Any],
+    body_width: float,
+    body_height: float,
+    target_xs: list[float] | None = None,
+) -> dict[str, Any] | None:
+    """Sucht die erste gueltige Flugbahn von einem konkreten Standpunkt."""
+    rect = target_platform["rect"]
+    target_points_to_try = target_xs or target_points(start["x"], rect, body_width)
+    for strength_index in range(
+        round((MAX_JUMP_STRENGTH - MIN_JUMP_STRENGTH) / STRENGTH_STEP) + 1
+    ):
+        strength = MIN_JUMP_STRENGTH + strength_index * STRENGTH_STEP
+        for target_x in target_points_to_try:
+            target = {"x": target_x, "y": platform_top(rect)}
+            trajectory = calculate_flight_trajectory(
+                start,
+                target,
+                strength=strength,
+                clearance=body_height,
+            )
+            if trajectory is None or trajectory["landing_error"] > body_width / 2:
+                continue
+            trajectory["strength"] = strength
+            if not has_flight_collision(
+                start,
+                trajectory,
+                platforms,
+                ignored_platform,
+                body_width,
+                body_height,
+            ):
+                trajectory["target_x"] = target_x
+                return trajectory
+    return None
+
+
 def current_platform(
     state: dict[str, Any],
 ) -> dict[str, Any]:
@@ -252,131 +307,157 @@ def current_platform(
     }
 
 
-def find_side_jump(
-    state: dict[str, Any],
-    blocked_platform: dict[str, Any],
-) -> dict[str, Any] | None:
-    """Versetzt den Spieler mit einem schnellen Sprung aus dem Schattenbereich."""
-    position = state.get("position", {})
-    dimensions = state.get("dimensions", {})
-    body_width = dimensions.get("x", PLAYER_WIDTH)
-    body_height = dimensions.get("y", PLAYER_HEIGHT)
-    support = current_platform(state)
-    support_rect = support["rect"]
-    height = player_height(state)
-    blocked_rect = blocked_platform["rect"]
-    buffered_points = [
-        support_rect["x"] + body_width / 2 + SIDE_PLATFORM_BUFFER,
-        support_rect["x"]
-        + support_rect["width"]
-        - body_width / 2
-        - SIDE_PLATFORM_BUFFER,
-    ]
-    free_points = [
-        point
-        for point in buffered_points
-        if support_rect["x"] + body_width / 2 <= point
-        <= support_rect["x"] + support_rect["width"] - body_width / 2
-        and (
-            point < blocked_rect["x"] - body_width / 2
-            or point > blocked_rect["x"] + blocked_rect["width"] + body_width / 2
-        )
-    ]
-    if free_points:
-        valid_points = sorted(
-            free_points, key=lambda point: abs(point - position.get("x", 0.0))
-        )
-    else:
-        valid_points = sorted(
-            buffered_points,
-            key=lambda point: abs(point - position.get("x", 0.0)),
-            reverse=True,
-        )
-
-    for strength_index in range(
-        round(SIDE_JUMP_MAX_STRENGTH / SIDE_JUMP_STEP), 0, -1
-    ):
-        strength = strength_index * SIDE_JUMP_STEP
-        for target_x in valid_points:
-            target = {"x": target_x, "y": platform_top(support_rect)}
-            trajectory = calculate_flight_trajectory(
-                position,
-                target,
-                strength=strength,
-                clearance=height,
-            )
-            if trajectory is None or trajectory["landing_error"] > body_width / 2:
-                continue
-            trajectory["strength"] = strength
-            if not has_flight_collision(
-                position,
-                trajectory,
-                state.get("surrounding_platforms", []),
-                support,
-                body_width,
-                body_height,
-            ):
-                return {"platform": support, "trajectory": trajectory}
-    return None
-
-
 def find_next_jump(state: dict[str, Any]) -> dict[str, Any] | None:
-    """Waehlt die naechste hoeher gelegene Plattform und eine Flugbahn dorthin."""
+    """Waehlt einen direkten oder ueber eine gleichhohe Plattform fuehrenden Sprung."""
     position = state.get("position", {})
     platforms = state.get("surrounding_platforms", [])
-    candidates = [
-        platform
-        for platform in platforms
-        if platform_top(platform.get("rect", {})) > position.get("y", 0.0) + 0.5
-    ]
-    candidates.sort(key=lambda platform: platform["rect"]["y"])
     dimensions = state.get("dimensions", {})
     body_width = dimensions.get("x", PLAYER_WIDTH)
     body_height = dimensions.get("y", PLAYER_HEIGHT)
-    height = player_height(state)
+    current = current_platform(state)
+    current_rect = current["rect"]
+    current_level = platform_top(current_rect)
+    higher_platforms = sorted(
+        (
+            platform
+            for platform in platforms
+            if platform is not current
+            and platform_top(platform["rect"]) > current_level + 0.5
+        ),
+        key=lambda platform: platform_top(platform["rect"]),
+    )
+    if not higher_platforms:
+        return None
 
-    for platform in candidates:
-        rect = platform["rect"]
-        position_x = position.get("x", 0.0)
-        directly_overhead = (
-            rect["x"] - body_width / 2
-            <= position_x
-            <= rect["x"] + rect["width"] + body_width / 2
+    next_platform = higher_platforms[0]
+    current_position = {
+        "x": position.get("x", 0.0),
+        "y": position.get("y", current_level),
+    }
+    trajectory = find_trajectory_to_platform(
+        current_position,
+        next_platform,
+        platforms,
+        current,
+        body_width,
+        body_height,
+    )
+    if trajectory is not None:
+        jump = {"platform": next_platform, "trajectory": trajectory}
+        log_jump_plan(state, jump, next_platform)
+        return jump
+
+    for start_x in platform_start_points(
+        current_rect,
+        body_width,
+        preferred_x=current_position["x"],
+    ):
+        start = {"x": start_x, "y": current_level}
+        trajectory = find_trajectory_to_platform(
+            start,
+            next_platform,
+            platforms,
+            current,
+            body_width,
+            body_height,
         )
-        if directly_overhead:
-            side_jump = find_side_jump(state, platform)
-            if side_jump is not None:
-                log_jump_plan(state, side_jump, platform)
-                return side_jump
-
-        for strength_index in range(
-            round((MAX_JUMP_STRENGTH - MIN_JUMP_STRENGTH) / STRENGTH_STEP) + 1
-        ):
-            strength = MIN_JUMP_STRENGTH + strength_index * STRENGTH_STEP
-            for target_x in target_points(position["x"], rect, body_width):
-                target = {"x": target_x, "y": platform_top(rect)}
-                trajectory = calculate_flight_trajectory(
-                    position, target, strength=strength, clearance=height
-                )
-                if trajectory is None or trajectory["landing_error"] > body_width / 2:
-                    continue
-                trajectory["strength"] = strength
-                if not has_flight_collision(
-                    position,
-                    trajectory,
+        if trajectory is not None:
+            if math.isclose(start_x, current_position["x"], abs_tol=body_width / 2):
+                jump = {"platform": next_platform, "trajectory": trajectory}
+            else:
+                reposition = find_trajectory_to_platform(
+                    current_position,
+                    current,
                     platforms,
-                    platform,
+                    current,
                     body_width,
                     body_height,
+                    target_xs=[start_x],
+                )
+                if reposition is None:
+                    continue
+                jump = {
+                    "platform": current,
+                    "trajectory": reposition,
+                    "planned_platform": next_platform,
+                    "planned_trajectory": trajectory,
+                }
+            log_jump_plan(state, jump, next_platform)
+            return jump
+
+    same_level_platforms = [
+        platform
+        for platform in platforms
+        if platform is not current
+        and math.isclose(platform_top(platform["rect"]), current_level)
+    ]
+    for intermediate in same_level_platforms:
+        for intermediate_x in platform_start_points(
+            intermediate["rect"], body_width
+        ):
+            onward = find_trajectory_to_platform(
+                {"x": intermediate_x, "y": current_level},
+                next_platform,
+                platforms,
+                intermediate,
+                body_width,
+                body_height,
+            )
+            if onward is None:
+                continue
+
+            first_leg = find_trajectory_to_platform(
+                current_position,
+                intermediate,
+                platforms,
+                current,
+                body_width,
+                body_height,
+                target_xs=[intermediate_x],
+            )
+            if first_leg is None:
+                for start_x in platform_start_points(
+                    current_rect,
+                    body_width,
+                    preferred_x=current_position["x"],
                 ):
-                    jump = {"platform": platform, "trajectory": trajectory}
-                    log_jump_plan(state, jump, platform)
-                    return jump
-        if rect["x"] - body_width / 2 <= position_x <= rect["x"] + rect["width"] + body_width / 2:
-            side_jump = find_side_jump(state, platform)
-            if side_jump is not None:
-                log_jump_plan(state, side_jump, platform)
-                return side_jump
+                    first_leg = find_trajectory_to_platform(
+                        {"x": start_x, "y": current_level},
+                        intermediate,
+                        platforms,
+                        current,
+                        body_width,
+                        body_height,
+                        target_xs=[intermediate_x],
+                    )
+                    if first_leg is not None:
+                        break
+            if first_leg is not None:
+                if not math.isclose(
+                    first_leg["target_x"],
+                    current_position["x"],
+                    abs_tol=body_width / 2,
+                ):
+                    reposition = find_trajectory_to_platform(
+                        current_position,
+                        current,
+                        platforms,
+                        current,
+                        body_width,
+                        body_height,
+                        target_xs=[first_leg["target_x"]],
+                    )
+                    if reposition is None:
+                        continue
+                    first_leg = reposition
+                jump = {
+                    "platform": intermediate,
+                    "trajectory": first_leg,
+                    "planned_platform": next_platform,
+                    "planned_trajectory": onward,
+                }
+                log_jump_plan(state, jump, intermediate)
+                return jump
     return None
 
 
